@@ -1,0 +1,406 @@
+---
+title: "Global 리더 차세대리더 포트폴리오"
+date: last-modified
+date-format: "[Last Updated on] MMMM dd, YYYY"
+format: 
+  html:
+    toc: true
+    number-sections: true
+    embed-resources: false
+    theme: flatly
+    title-block-banner: true
+editor: visual
+execute:
+  echo: false
+  message: false
+  warning: false
+editor_options: 
+  chunk_output_type: console
+---
+
+### Note
+
+1.  USD 기준 수익률
+
+```{r}
+pacman::p_load(kwlib, plotly, ggrepel, trelliscopejs, gt, here, gtExtras, ggthemes, dygraphs)
+source(here("03.script/get_port_return.R"))
+
+port <- read_xlsx(here("02.port/LF_2312.xlsx")) %>% 
+  mutate(td = ymd(td))
+
+read_single_sheet <- function(path, sheet_name) {
+  read_xlsx(here(path), sheet = sheet_name) %>% 
+    pivot_longer(-td, names_to = "ticker", values_to = sheet_name) %>% 
+    mutate(td = ymd(td))
+}
+
+filter_weekdays <- function(dat) {
+  dat %>% 
+    mutate(wday = wday(td)) %>% 
+    filter(!wday %in% c(1, 7)) %>% 
+    select(-wday)
+}
+
+read_excel_file <- function(path, sheet_vec) {
+  sheet_vec %>% 
+    map(
+      .f = ~read_single_sheet(here(path), sheet_name = .x)
+    ) %>% 
+    reduce(left_join, by = c("td", "ticker")) 
+}
+
+path <- "01.data/data.xlsx"
+
+sheet_vec <- excel_sheets(here(path))
+
+daily_dat <- read_excel_file(path, c("open", "high", "low", "close", "rtn_stock_usd")) %>% 
+  filter_weekdays() %>% 
+  rename(rtn = rtn_stock_usd) %>% 
+  mutate(rtn = rtn / 100)
+
+daily_rtn_bm <- read_excel_file(path, "rtn_bm_usd") %>% 
+  filter_weekdays() %>% 
+  rename(rtn = rtn_bm_usd) %>% 
+  mutate(rtn = rtn / 100) %>% 
+  mutate(ticker = str_remove(ticker, "-US"))
+
+financials_dat <- read_xlsx(here(path), sheet = "financials") 
+
+port_rtn <- get_port_return(port, daily_dat)
+
+port_rtn2 <- port_rtn %>% 
+  pluck("port_return") %>%
+  select(td, rtn = rtn_with_cost) %>% 
+  mutate(ticker = "port")
+
+plot_dat<- 
+  bind_rows(
+    port_rtn2,
+    daily_rtn_bm %>% 
+      filter(td >= min(port_rtn2$td))
+  ) %>% 
+  mutate(rtn_cum = cumprod(rtn + 1) - 1, .by = ticker)
+
+target_rebal <- max(port$td)
+target_ticker <- port %>% filter(td == target_rebal) %>% pull(ticker) %>% unique() 
+```
+
+## 누적수익률 - 테이블
+
+```{r}
+
+
+# 포트 수익 테이블
+port_rtn_tbl <- plot_dat %>% 
+  filter(td > target_rebal) %>% 
+  mutate(
+    rtn_1w = slide_dbl(rtn, ~prod(. + 1) - 1, .before = 4, .complete = TRUE),
+    rtn_max = slide_dbl(rtn, ~prod(. + 1) - 1, .before = Inf, .complete = TRUE),
+    .by = ticker
+  ) %>% 
+  filter(td == max(td)) %>% 
+  select(td, ticker, rtn_1d = rtn, rtn_1w, rtn_max)
+
+add_color <- function(x){
+  if(is.na(x)) return(x)
+  
+  add_color <- case_when(
+    x > 0 ~ "background: hsl(116, 60%, 90%); color: hsl(116, 30%, 25%);",
+    x < 0 ~ "background: hsl(350, 70%, 90%); color: hsl(350, 45%, 30%);",
+    x == 0 ~ "background: hsl(230, 70%, 90%); color: hsl(230, 45%, 30%);"
+  )
+  div_out <- htmltools::div(
+    style = paste(
+      "display: inline-block; padding: 2px 12px; border-radius: 15px; font-weight: 600; font-size: 14px;",
+      add_color
+    ),
+    percent(x, 0.01)
+  )
+  
+  as.character(div_out) %>% 
+    gt::html()
+}
+
+port_rtn_tbl %>% 
+  # mutate(rtn_1d = map(rtn_1d, add_color)) %>% 
+  mutate(across(contains("rtn"), ~map(.x, add_color))) %>% 
+  gt() %>% 
+  tab_header(
+    title = md("**Performance**"),
+    subtitle = str_glue("As of {unique(port_rtn_tbl$td)}")
+  ) %>% 
+  fmt_percent(
+    columns = where(is.numeric)
+  ) %>% 
+  cols_label(
+    ticker = md("**Type**"),
+    rtn_1d = md("**1 Day**"),
+    rtn_1w = md("**1 Week**"),
+    rtn_max = md("**MTD**")
+  ) %>% 
+  sub_missing(missing_text = "") %>% 
+  cols_hide(td) %>% 
+  opt_interactive(
+    use_highlight = TRUE
+  )
+  
+```
+
+## 누적수익률 - 차트
+
+```{r}
+#| fig-height: 4
+target_rebal <- max(port$td)
+
+plot_dat_tmp <- plot_dat %>% 
+  filter(td >= target_rebal) %>% 
+  mutate(rtn = if_else(td == target_rebal, 0, rtn)) %>% 
+  mutate(rtn_cum = cumprod(rtn + 1) - 1, .by = ticker) %>% 
+  select(td, ticker, rtn_cum) %>% 
+  pivot_wider(names_from = ticker, values_from = rtn_cum) %>% 
+  mutate(diff_SPY = port - SPY, diff_QQQ = port - QQQ)
+
+plot_dat_tmp %>% 
+  select(td, port, SPY, QQQ) %>% 
+  dygraph(main = "Portfolio Return", group = "port_cum_rtn") %>%
+  dyRangeSelector() %>% 
+  dyLegend(width = 300) %>% 
+  dyAxis(
+    "y", 
+    valueFormatter = "function(v){return (v*100).toFixed(1) + '%'}",
+    axisLabelFormatter = "function(v){return (v*100).toFixed(0) + '%'}"
+  ) 
+
+plot_dat_tmp %>% 
+  select(td, contains("diff")) %>% 
+  dygraph(main = "Portfolio Return Diff", group = "port_cum_rtn") %>%
+  dyAxis(
+    "y", 
+    valueFormatter = "function(v){return (v*100).toFixed(1) + '%'}",
+    axisLabelFormatter = "function(v){return (v*100).toFixed(0) + '%'}"
+  ) %>% 
+  dyOptions(fillGraph = TRUE, fillAlpha = 0.4)
+```
+
+## 개별종목 수익률 기여
+
+```{r}
+g_indv_contrib <- port %>% 
+  filter(td == target_rebal) %>% 
+  left_join(
+    port_rtn %>% 
+      pluck("port_weight_daily") %>% 
+      filter(term == target_rebal) %>% 
+      summarise(
+        rtn_cum = last(rtn_cum),
+        .by = ticker
+      ),
+    by = c("ticker")
+  ) %>% 
+  mutate(contrib = weight * (rtn_cum - 1)) %>% 
+  mutate(contrib_theme = sum(contrib), .by = theme) %>% 
+  mutate(ticker = fct_reorder(ticker, contrib_theme)) %>% 
+  mutate(ticker = fct_reorder(ticker, contrib)) %>% 
+  ggplot(aes(contrib, ticker, label = percent(contrib, accuracy = .1), fill = theme)) + 
+  geom_col() + 
+  scale_x_continuous(labels = label_percent(accuracy = .1)) +
+  geom_label_repel(point.size = NA, fill = "white") + 
+  labs(x = "", y = "") +
+  theme_calc() +
+  scale_fill_calc()
+
+g_indv_contrib
+```
+
+## 개별종목 수익률 테이블
+
+```{r}
+indv_rtn_tbl <- port_rtn %>% 
+  pluck("port_weight_daily") %>% 
+  filter(term == target_rebal) %>% 
+  # select(td, ticker, rtn, weight) %>% 
+  mutate(
+    rtn_1w = slide_dbl(rtn, ~prod(. + 1) - 1, .before = 4, .complete = TRUE),
+    rtn_max = slide_dbl(rtn, ~prod(. + 1) - 1, .before = Inf, .complete = TRUE),
+    .by = ticker
+  ) %>% 
+  filter(td == max(td)) %>% 
+  select(term, ticker, weight, rtn_1d = rtn, rtn_1w, rtn_max)
+
+indv_rtn_tbl2 <- port %>% 
+  semi_join(indv_rtn_tbl, by = c("td" = "term")) %>% 
+  select(theme, ticker, name) %>% 
+  left_join(indv_rtn_tbl, by = "ticker") %>% 
+  mutate(n_ticker = n(), .by = ticker) %>% 
+  mutate(weight = weight / n_ticker) %>% 
+  select(-c(term, n_ticker))
+
+indv_rtn_tbl2 %>% 
+  mutate(across(contains("rtn"), ~map(.x, add_color))) %>% 
+  gt(
+    groupname_col = "theme",
+  ) %>% 
+  tab_header(
+    title = md("**Performance**"),
+    subtitle = "As of 2024-01-05"
+  ) %>% 
+  fmt_percent(
+    columns = where(is.numeric)
+  ) %>% 
+  tab_spanner(
+    label = "Performance",
+    columns = c(contains("rtn"))
+  ) %>% 
+  cols_label(
+    ticker = md("**Ticker**"),
+    name = md("**Name**"),
+    weight = md("**Weight**"),
+    rtn_1d = md("**1 Day**"),
+    rtn_1w = md("**1 Week**"),
+    rtn_max = md("**MTD**")
+  ) %>% 
+  sub_missing(missing_text = "") %>% 
+  opt_interactive(
+    use_highlight = TRUE
+  ) %>% 
+  tab_options(
+    table.font.size = px(8)
+  )
+
+```
+
+## 개별종목 정보
+
+```{r}
+#| column: page
+financials_column_dat <- read_xlsx(here("01.data/column_dat.xlsx"))
+financials_dat2 <- financials_dat %>% 
+  mutate(across(contains(c("gro", "chg", "surp")), ~./100)) %>% 
+  pivot_longer(-ticker, names_to = "account", values_to = "value") %>% 
+  pivot_wider(names_from = ticker, values_from = value) %>% 
+  left_join(financials_column_dat, by = "account") 
+
+financials_dat2 %>% 
+  gt(groupname_col = c("cat", "cat2"), rowname_col = "period") %>%
+  fmt_percent(
+    columns = where(is.numeric),
+    rows = account %in% (str_subset(financials_dat2$account, "gro|chg|surp"))
+  ) %>%
+  fmt_number(
+    columns = where(is.numeric),
+    rows = account %in% c("sales_ltm", "ni_ltm", "sales_ntm" ,"ni_ntm"),
+    decimals = 0
+  ) %>%
+  fmt_number(
+    columns = where(is.numeric),
+    rows = account %in% c("per_ntm"),
+    decimals = 2
+  ) %>%
+  cols_hide(account) %>% 
+  sub_missing(missing_text = "-") %>% 
+  sub_values(values = 1000, replacement = "흑전") %>% 
+  sub_values(values = -1000, replacement = "적전") %>% 
+  tab_style(
+    style = list(
+      cell_fill("#585d63"),
+      cell_text(color = "white", weight = "bold")
+    ),
+    locations = cells_row_groups()
+  ) %>%
+  gt_theme_pff() %>% 
+  tab_options(
+      row.striping.background_color = "grey90"
+  )
+  
+  
+```
+
+## 개별종목 수익률 추이(3년)
+
+```{r}
+#| fig-width: 5
+#| fig-height: 3
+#| eval: false
+g_stock_hist <- daily_dat %>% 
+  filter(ticker %in% target_ticker) %>% 
+  filter(!is.na(rtn)) %>% 
+  mutate(rtn_cum = cumprod(rtn + 1) -1,
+         return = percent(rtn_cum, accuracy = .01),
+         .by = ticker) %>% 
+  ggplot(aes(td, rtn_cum, text = return, group = ticker)) +
+  geom_line() +
+  scale_y_continuous(labels = label_percent()) +
+  facet_wrap(~ticker, ncol = 4, scales = "free")  +
+  labs(x = "", y = "")
+
+ggplotly(g_stock_hist, tooltip = c("x", "text"))
+  
+```
+
+```{r}
+#| column: page
+#| layout-ncol: 2
+
+plot_candle <- function(ticker, daily_dat) {
+  g <- daily_dat %>% 
+    filter(ticker == !!ticker) %>% 
+    select(-rtn) %>% 
+    timetk::tk_xts(silent = TRUE) %>% 
+    dygraph(main = ticker) %>% 
+    dyCandlestick(compress = TRUE)
+  g
+}
+
+# plot_candle2 <- function(ticker_vec, daily_dat) {
+#   ticker_vec <- port %>% filter(td == target_rebal) %>% pull(ticker) %>% unique() 
+#   res <- ticker_vec %>% map(plot_candle, daily_dat)
+#   print(res)
+# }
+
+
+# g1 <-  plot_candle(target_ticker[1], daily_dat) 
+# g1
+# g2 <- plot_candle(target_ticker[2], daily_dat)
+# g2
+res <- map(target_ticker, plot_candle, daily_dat)
+htmltools::tagList(res[1:5])
+htmltools::tagList(res[6:10])
+# htmltools::tagList(res[8:10])
+
+```
+
+
+## 누적수익률 (Since 2023-10-31)
+
+```{r}
+#| fig-height: 4
+
+plot_dat_tmp2 <- plot_dat %>% 
+  mutate(rtn = if_else(td == target_rebal, 0, rtn)) %>% 
+  mutate(rtn_cum = cumprod(rtn + 1) - 1, .by = ticker) %>% 
+  select(td, ticker, rtn_cum) %>% 
+  pivot_wider(names_from = ticker, values_from = rtn_cum) %>% 
+  mutate(diff_SPY = port - SPY, diff_QQQ = port - QQQ)
+
+plot_dat_tmp2 %>% 
+  select(td, port, SPY, QQQ) %>% 
+  dygraph(main = "Portfolio Return", group = "port_cum_rtn2") %>%
+  dyLegend(width = 300) %>% 
+  dyRangeSelector() %>% 
+  dyAxis(
+    "y", 
+    valueFormatter = "function(v){return (v*100).toFixed(1) + '%'}",
+    axisLabelFormatter = "function(v){return (v*100).toFixed(0) + '%'}"
+  ) 
+
+plot_dat_tmp2 %>% 
+  select(td, contains("diff")) %>% 
+  dygraph(main = "Portfolio Return Diff", group = "port_cum_rtn2") %>%
+  dyAxis(
+    "y", 
+    valueFormatter = "function(v){return (v*100).toFixed(1) + '%'}",
+    axisLabelFormatter = "function(v){return (v*100).toFixed(0) + '%'}"
+  ) %>% 
+  dyOptions(fillGraph = TRUE, fillAlpha = 0.4)
+```
